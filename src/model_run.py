@@ -2,21 +2,21 @@
 # The RWKV Language Model - https://github.com/BlinkDL/RWKV-LM
 ########################################################################################################
 
-import types, math, os, gc
-import torch
-from torch.nn import functional as F
-torch.backends.cudnn.benchmark = True
-torch.backends.cudnn.allow_tf32 = True
-torch.backends.cuda.matmul.allow_tf32 = True
+import types, os, gc
+import paddle
+import paddle.nn as nn
+import paddle.nn.functional as F
+import paddle.jit as jit
 
-MyModule = torch.nn.Module
+
+MyLayer = nn.Layer
 def __nop(ob):
     return ob
 MyFunction = __nop
 
 if int(os.environ["RWKV_JIT_ON"]) > 0:
-    MyModule = torch.jit.ScriptModule
-    MyFunction = torch.jit.script_method
+    MyLayer = jit.TranslatedLayer
+    MyFunction = jit.to_static
 
 print(f'\nRWKV_JIT_ON {os.environ["RWKV_JIT_ON"]}\n')
 
@@ -24,27 +24,27 @@ RWKV_RESCALE_LAYER = 6 # set x = x/2 every X layer (to avoid FP16 overflow)
 
 ############################################################################################################
 
-class RWKV_RNN(MyModule):
+class RWKV_RNN(MyLayer):
     def __init__(self, args):
         super().__init__()
 
         self.args = args
         if args.FLOAT_MODE == 'fp32':
-            self.FLOAT_MODE = torch.float
+            self.FLOAT_MODE = paddle.float32
         elif args.FLOAT_MODE == 'fp16':
-            self.FLOAT_MODE = torch.half
+            self.FLOAT_MODE = paddle.float16
         elif args.FLOAT_MODE == 'bf16':
-            self.FLOAT_MODE = torch.bfloat16
+            self.FLOAT_MODE = paddle.bfloat16
         self.RUN_DEVICE = args.RUN_DEVICE
 
-        with torch.no_grad():
-            w = torch.load(args.MODEL_NAME + '.pth', map_location='cpu')
+        with paddle.no_grad():
+            w = paddle.load(args.MODEL_NAME + '.pdparams')
             args.n_embd = w['emb.weight'].shape[1]
             args.n_layer = 0
             keys = list(w.keys()) # refine weights and send to correct device
             print_need_newline = False
             for x in keys:
-                w[x].requires_grad = False
+                w[x].stop_gradient = True
                 if x == 'emb.weight' or 'ln0' in x:
                     continue
                 
@@ -57,12 +57,12 @@ class RWKV_RNN(MyModule):
                     w[x] = w[x].t()
                 
                 if '.time_decay' in x:
-                    w[x] = w[x].float()
-                    w[x] = -torch.exp(w[x])
+                    w[x] = w[x].cast(self.FLOAT_MODE)
+                    w[x] = -paddle.exp(w[x])
                 elif '.time_first' in x:
-                    w[x] = w[x].float()
+                    w[x] = w[x].cast(self.FLOAT_MODE)
                 else:
-                    w[x] = w[x].to(dtype=self.FLOAT_MODE)
+                    w[x] = w[x].cast(self.FLOAT_MODE)
 
                 if args.FLOAT_MODE == 'fp16':
                     if 'att.output.weight' in x:
@@ -83,7 +83,7 @@ class RWKV_RNN(MyModule):
                     if print_need_newline:
                         print('\n', end = '')
                         print_need_newline = False
-                    print(x.ljust(32), str(w[x].dtype).replace('torch.', '').ljust(10), w[x].device, shape)
+                    print(x.ljust(32), str(w[x].dtype).replace('torch.', '').ljust(10), shape)
                 else:
                     print_need_newline = True
                     print('.', end = '', flush = True)
@@ -110,16 +110,16 @@ class RWKV_RNN(MyModule):
                             setattr(here, xx[i], types.SimpleNamespace())
                     here = getattr(here, xx[i])
 
-        with torch.no_grad(): # precompute embedding
+        with paddle.no_grad(): # precompute embedding
             try:
                 x = self.LN(self.w.emb.weight, self.w.blocks[0].ln0)
             except:
-                x = F.layer_norm(self.w.emb.weight.float(), (self.args.n_embd,), weight=self.w.blocks[0].ln0.weight.float(), bias=self.w.blocks[0].ln0.bias.float())
-            self.w.emb.weight = x.to(dtype=self.FLOAT_MODE)
+                x = F.layer_norm(self.w.emb.weight.cast(self.FLOAT_MODE), (self.args.n_embd,), weight=self.w.blocks[0].ln0.weight.cast(self.FLOAT_MODE), bias=self.w.blocks[0].ln0.bias.cast(self.FLOAT_MODE))
+            self.w.emb.weight = x.cast(self.FLOAT_MODE)
 
         self.eval()
         gc.collect()
-        torch.cuda.empty_cache()
+        paddle.device.cuda.empty_cache()
 
     def LN(self, x, w):
         return F.layer_norm(x, (self.args.n_embd,), weight=w.weight, bias=w.bias)
@@ -128,70 +128,70 @@ class RWKV_RNN(MyModule):
 
     @MyFunction
     def FF_one(self, x, state, i:int, time_mix_k, time_mix_r, kw, vw, rw):
-        xx = state[5*i+0].to(dtype=self.FLOAT_MODE)
+        xx = state[5*i+0].cast(self.FLOAT_MODE)
         xk = x * time_mix_k + xx * (1 - time_mix_k)
         xr = x * time_mix_r + xx * (1 - time_mix_r)
-        state[5*i+0] = x.float()
+        state[5*i+0] = x.cast(self.FLOAT_MODE)
 
-        r = torch.sigmoid(xr @ rw)
-        k = torch.square(torch.relu(xk @ kw))
+        r = F.sigmoid(xr @ rw)
+        k = paddle.square(F.relu(xk @ kw))
         kv = k @ vw
         return r * kv
 
     @MyFunction
     def FF_seq(self, x, state, i:int, time_mix_k, time_mix_r, kw, vw, rw):
-        xx = torch.cat((state[5*i+0].to(dtype=self.FLOAT_MODE).unsqueeze(0), x[:-1,:]))
+        xx = paddle.concat((state[5*i+0].cast(self.FLOAT_MODE).unsqueeze(0), x[:-1,:]))
         xk = x * time_mix_k + xx * (1 - time_mix_k)
         xr = x * time_mix_r + xx * (1 - time_mix_r)
-        state[5*i+0] = x[-1,:].float()
+        state[5*i+0] = x[-1,:].cast(self.FLOAT_MODE)
 
-        r = torch.sigmoid(xr @ rw)
-        k = torch.square(torch.relu(xk @ kw))
+        r = F.sigmoid(xr @ rw)
+        k = paddle.square(F.relu(xk @ kw))
         kv = k @ vw
         return r * kv
 
     @MyFunction
     def SA_one(self, x, state, i:int, time_mix_k, time_mix_v, time_mix_r, time_first, time_decay, kw, vw, rw, ow):
-        xx = state[5*i+1].to(dtype=self.FLOAT_MODE)
+        xx = state[5*i+1].cast(self.FLOAT_MODE)
         xk = x * time_mix_k + xx * (1 - time_mix_k)
         xv = x * time_mix_v + xx * (1 - time_mix_v)
         xr = x * time_mix_r + xx * (1 - time_mix_r)
-        state[5*i+1] = x.float()
+        state[5*i+1] = x.cast(self.FLOAT_MODE)
 
-        r = torch.sigmoid(xr @ rw)
-        k = (xk @ kw).float()
-        v = (xv @ vw).float()
+        r = F.sigmoid(xr @ rw)
+        k = (xk @ kw).cast(self.FLOAT_MODE)
+        v = (xv @ vw).cast(self.FLOAT_MODE)
 
         aa = state[5*i+2]
         bb = state[5*i+3]
         pp = state[5*i+4]
         ww = time_first + k
-        p = torch.maximum(pp, ww)
-        e1 = torch.exp(pp - p)
-        e2 = torch.exp(ww - p)
+        p = paddle.maximum(pp, ww)
+        e1 = paddle.exp(pp - p)
+        e2 = paddle.exp(ww - p)
         a = e1 * aa + e2 * v
         b = e1 * bb + e2
         ww = pp + time_decay
-        p = torch.maximum(ww, k)
-        e1 = torch.exp(ww - p)
-        e2 = torch.exp(k - p)
+        p = paddle.maximum(ww, k)
+        e1 = paddle.exp(ww - p)
+        e2 = paddle.exp(k - p)
         state[5*i+2] = e1 * aa + e2 * v
         state[5*i+3] = e1 * bb + e2
         state[5*i+4] = p
-        wkv = (a / b).to(dtype=self.FLOAT_MODE)
+        wkv = (a / b).cast(self.FLOAT_MODE)
         return (r * wkv) @ ow
 
     @MyFunction
     def SA_seq(self, x, state, i:int, time_mix_k, time_mix_v, time_mix_r, time_first, time_decay, kw, vw, rw, ow):
-        xx = torch.cat((state[5*i+1].to(dtype=self.FLOAT_MODE).unsqueeze(0), x[:-1,:]))
+        xx = paddle.concat((state[5*i+1].cast(self.FLOAT_MODE).unsqueeze(0), x[:-1,:]))
         xk = x * time_mix_k + xx * (1 - time_mix_k)
         xv = x * time_mix_v + xx * (1 - time_mix_v)
         xr = x * time_mix_r + xx * (1 - time_mix_r)
-        state[5*i+1] = x[-1,:].float()
+        state[5*i+1] = x[-1,:].cast(self.FLOAT_MODE)
 
-        r = torch.sigmoid(xr @ rw)
-        k = (xk @ kw).float()
-        v = (xv @ vw).float()
+        r = F.sigmoid(xr @ rw)
+        k = (xk @ kw).cast(self.FLOAT_MODE)
+        v = (xv @ vw).cast(self.FLOAT_MODE)
 
         aa = state[5*i+2]
         bb = state[5*i+3]
@@ -199,15 +199,15 @@ class RWKV_RNN(MyModule):
         T = x.shape[0]
         for t in range(T):
             ww = time_first + k[t]
-            p = torch.maximum(pp, ww)
-            e1 = torch.exp(pp - p)
-            e2 = torch.exp(ww - p)
+            p = paddle.maximum(pp, ww)
+            e1 = paddle.exp(pp - p)
+            e2 = paddle.exp(ww - p)
             a = e1 * aa + e2 * v[t]
             b = e1 * bb + e2
             ww = pp + time_decay
-            p = torch.maximum(ww, k[t])
-            e1 = torch.exp(ww - p)
-            e2 = torch.exp(k[t] - p)
+            p = paddle.maximum(ww, k[t])
+            e1 = paddle.exp(ww - p)
+            e2 = paddle.exp(k[t] - p)
             if t != T - 1:
                 aa = e1 * aa + e2 * v[t]
                 bb = e1 * bb + e2
@@ -216,11 +216,11 @@ class RWKV_RNN(MyModule):
                 state[5*i+2] = e1 * aa + e2 * v[t]
                 state[5*i+3] = e1 * bb + e2
                 state[5*i+4] = p
-            xx[t] = (a / b).to(dtype=self.FLOAT_MODE)
+            xx[t] = (a / b).cast(self.FLOAT_MODE)
         return (r * xx) @ ow
 
     def forward(self, tokens, state, preprocess_only = False):
-        with torch.no_grad():
+        with paddle.no_grad():
             w = self.w
             args = self.args
 
@@ -231,7 +231,7 @@ class RWKV_RNN(MyModule):
                 x = x.cuda()
 
             if state == None:
-                state = torch.zeros(args.n_layer * 5, args.n_embd, device=self.RUN_DEVICE)
+                state = paddle.zeros((args.n_layer * 5, args.n_embd))
                 for i in range(args.n_layer):
                     state[5*i+4] -= 1e30
 
@@ -259,4 +259,4 @@ class RWKV_RNN(MyModule):
             x = self.LN(x[-1,:], w.ln_out) if seq_mode else self.LN(x, w.ln_out)
             x = w.head.weight @ x
 
-            return x.float(), state
+            return x.cast(self.FLOAT_MODE), state

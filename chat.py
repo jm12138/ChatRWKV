@@ -2,7 +2,7 @@
 # The RWKV Language Model - https://github.com/BlinkDL/RWKV-LM
 ########################################################################################################
 
-import os, copy, types, gc, sys
+import os, copy, types, gc, sys, paddle
 import numpy as np
 try:
     os.environ["CUDA_VISIBLE_DEVICES"] = sys.argv[1]
@@ -15,15 +15,17 @@ print('\n\nChatRWKV project: https://github.com/BlinkDL/ChatRWKV')
 
 ########################################################################################################
 
-args.RUN_DEVICE = "cuda"  # cuda // cpu
+args.RUN_DEVICE = "cpu"  # cuda // cpu
+
+paddle.set_device(args.RUN_DEVICE)
 # fp16 (good for GPU, does NOT support CPU) // fp32 (good for CPU) // bf16 (worse accuracy, supports CPU)
-args.FLOAT_MODE = "fp16"
+args.FLOAT_MODE = "fp32"
 
-os.environ["RWKV_JIT_ON"] = '1' # '1' or '0', please use torch 1.13+ and benchmark speed
+os.environ["RWKV_JIT_ON"] = '0' # '1' or '0', please use torch 1.13+ and benchmark speed
 
-CHAT_LANG = 'English' # English // Chinese // more to come
+CHAT_LANG = 'Chinese' # English // Chinese // more to come
 
-QA_PROMPT = False # True: Q & A prompt // False: User & Bot prompt
+QA_PROMPT = True # True: Q & A prompt // False: User & Bot prompt
 # 中文问答设置QA_PROMPT=True（只能问答，问答效果更好，但不能闲聊） 中文聊天设置QA_PROMPT=False（可以闲聊，但需要大模型才适合闲聊）
 
 # Download RWKV-4 models from https://huggingface.co/BlinkDL (don't use Instruct-test models unless you use their prompt templates)
@@ -39,7 +41,7 @@ if CHAT_LANG == 'English':
     # args.MODEL_NAME = '/fsx/BlinkDL/CODE/_PUBLIC_/RWKV-LM/RWKV-v4neo/14b-run1/rwkv-6210'
 
 elif CHAT_LANG == 'Chinese':
-    args.MODEL_NAME = '/fsx/BlinkDL/HF-MODEL/rwkv-4-pile-7b/RWKV-4-Pile-7B-EngChn-test4-20230116'
+    args.MODEL_NAME = 'RWKV-4-Pile-1B5-EngChn-testNovel-301-ctx2048-20230214'
     # args.MODEL_NAME = '/fsx/BlinkDL/HF-MODEL/rwkv-4-pile-3b/RWKV-4-Pile-3B-EngChn-test4-20230115'
     # args.MODEL_NAME = '/fsx/BlinkDL/HF-MODEL/rwkv-4-pile-1b5/RWKV-4-Pile-1B5-EngChn-test4-20230115'
     # args.MODEL_NAME = '/fsx/BlinkDL/CODE/_PUBLIC_/RWKV-LM/RWKV-v4neo/7-run1z/rwkv-40'
@@ -61,7 +63,7 @@ AVOID_REPEAT = '，。：？！'
 
 os.environ["RWKV_RUN_DEVICE"] = args.RUN_DEVICE
 print(f'\nLoading ChatRWKV - {CHAT_LANG} - {args.RUN_DEVICE} - {args.FLOAT_MODE} - QA_PROMPT {QA_PROMPT}')
-import torch
+# import torch
 
 # please tune these (test True/False for all of them). can significantly improve speed.
 # torch._C._jit_set_profiling_executor(True)
@@ -71,9 +73,9 @@ import torch
 # torch._C._jit_set_texpr_fuser_enabled(False)
 # torch._C._jit_set_nvfuser_enabled(False)
 
-torch.backends.cudnn.benchmark = True
-torch.backends.cudnn.allow_tf32 = True
-torch.backends.cuda.matmul.allow_tf32 = True
+# torch.backends.cudnn.benchmark = True
+# torch.backends.cudnn.allow_tf32 = True
+# torch.backends.cuda.matmul.allow_tf32 = True
 from src.model_run import RWKV_RNN
 from src.utils import TOKENIZER
 tokenizer = TOKENIZER("20B_tokenizer.json")
@@ -249,7 +251,7 @@ print(f'\nRun prompt...')
 out = run_rnn(tokenizer.encode(init_prompt))
 save_all_stat('', 'chat_init', out)
 gc.collect()
-torch.cuda.empty_cache()
+paddle.device.cuda.empty_cache()
 
 srv_list = ['dummy_server']
 for s in srv_list:

@@ -2,10 +2,10 @@
 # The RWKV Language Model - https://github.com/BlinkDL/RWKV-LM
 ########################################################################################################
 
-import json, time, random, os
+import time, os
 import numpy as np
-import torch
-from torch.nn import functional as F
+import paddle
+import paddle.nn.functional as F
 from tokenizers import Tokenizer
 
 time_slot = {}
@@ -39,7 +39,7 @@ class TOKENIZER():
         return self.tokenizer.decode(x)
 
     def sample_logits(self, logits, x, ctx_len, temperature=1.0, top_p=1.0):
-        probs = F.softmax(logits.float(), dim=-1)
+        probs = F.softmax(logits.cast(paddle.float32), axis=-1)
 
         if os.environ["RWKV_RUN_DEVICE"] == "cpu":
             probs = probs.numpy()
@@ -53,11 +53,11 @@ class TOKENIZER():
             out = np.random.choice(a=len(probs), p=probs)
             return int(out)
         else:
-            sorted_probs = torch.sort(probs, descending=True)[0]
-            cumulative_probs = torch.cumsum(sorted_probs, dim=-1).cpu().numpy()
+            sorted_probs = paddle.sort(probs, descending=True)
+            cumulative_probs = paddle.cumsum(sorted_probs, axis=-1).cpu().numpy()
             cutoff = float(sorted_probs[np.argmax(cumulative_probs > top_p)])
             probs[probs < cutoff] = 0
             if temperature != 1.0:
                 probs = probs.pow(1.0 / temperature)
-            out = torch.multinomial(probs, num_samples=1)[0]
+            out = paddle.multinomial(probs, num_samples=1)[0]
             return int(out)
